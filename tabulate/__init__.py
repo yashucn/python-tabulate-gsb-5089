@@ -805,6 +805,25 @@ _ansi_escape_pat = rf"""
 """
 _ansi_codes = re.compile(_ansi_escape_pat, re.VERBOSE)
 _ansi_codes_bytes = re.compile(_ansi_escape_pat.encode("utf8"), re.VERBOSE)
+_osc8_hyperlink_pat = rf"""
+    {_osc}8;        # OSC opening
+    (\w+=\w+:?)*    # key=value params list
+    ;               # delimiter
+    [^{_esc}]+      # URI - anything but ESC
+    {_st}           # ST
+    [^{_esc}]+      # link text - anything but ESC
+    {_osc}8;;{_st}  # "closing" OSC sequence
+"""
+_osc8_hyperlinks = re.compile(_osc8_hyperlink_pat, re.VERBOSE)
+_ansi_color_codes = re.compile(
+    rf"""
+    {_csi}        # CSI
+    [\x30-\x3f]*  # parameter bytes
+    [\x20-\x2f]*  # intermediate bytes
+    [\x40-\x7e]   # final byte
+    """,
+    re.VERBOSE,
+)
 _ansi_color_reset_code = "\033[0m"
 
 _float_with_thousands_separators = re.compile(
@@ -1646,20 +1665,22 @@ def _wrap_text_to_colwidths(
                 # formatting of types (such as datetimes) may need to be more
                 # explicit than just `str` of the object. Also doesn't work for
                 # custom floatfmt/intfmt, nor with any missing/blank cells.
-                casted_cell = (
-                    missingval
-                    if cell is None
-                    else (
-                        str(cell)
-                        if cell == "" or _isnumber(cell)
-                        else str(_type(cell, numparse)(cell))
-                    )
-                )
-                wrapped = [
-                    "\n".join(wrapper.wrap(line))
-                    for line in casted_cell.splitlines()
-                    if line.strip() != ""
-                ]
+                if cell is None:
+                    casted_cell = missingval
+                elif cell == "" or _isnumber(cell):
+                    casted_cell = str(cell)
+                else:
+                    try:
+                        casted_cell = str(_type(cell, numparse=numparse)(cell))
+                    except (TypeError, ValueError):
+                        # Some strings (e.g. "80,443") look like numbers with
+                        # thousands separators but cannot be parsed by
+                        # int()/float(); keep them as-is, mirroring the
+                        # non-wrapping code path.
+                        casted_cell = str(cell)
+                # Blank lines within a cell are preserved: textwrap returns
+                # an empty list for them, which joins back into an empty line.
+                wrapped = ["\n".join(wrapper.wrap(line)) for line in casted_cell.splitlines()]
                 new_row.append("\n".join(wrapped))
             else:
                 new_row.append(cell)
@@ -2243,8 +2264,6 @@ def tabulate(
     list_of_lists, separating_lines = _remove_separating_lines(list_of_lists)
 
     if maxcolwidths is not None:
-        if type(maxcolwidths) is tuple:  # Check if tuple, convert to list if so
-            maxcolwidths = list(maxcolwidths)
         if len(list_of_lists):
             num_cols = len(list_of_lists[0])
         else:
@@ -2488,7 +2507,7 @@ def _expand_iterable(original, num_desired, default):
     length `num_desired` completely populated with `default will be returned
     """
     if isinstance(original, Iterable) and not isinstance(original, str):
-        return original + [default] * (num_desired - len(original))
+        return list(original) + [default] * (num_desired - len(original))
     else:
         return [default] * num_desired
 
@@ -2700,6 +2719,26 @@ class _CustomTextWrap(textwrap.TextWrapper):
         self.max_lines = None  # For python2 compatibility
         textwrap.TextWrapper.__init__(self, *args, **kwargs)
 
+    def _split(self, text):
+        """Split text into chunks, keeping OSC 8 hyperlinks intact.
+
+        Hyperlink escape sequences (including their link text, which may
+        itself contain whitespace) are kept as indivisible chunks so that
+        they are never broken across lines and never counted towards the
+        visible width of a line. All other text, including CSI color
+        codes, is chunked exactly as before.
+        """
+        chunks = []
+        pos = 0
+        for match in _osc8_hyperlinks.finditer(text):
+            if match.start() > pos:
+                chunks.extend(textwrap.TextWrapper._split(self, text[pos : match.start()]))
+            chunks.append(match.group(0))
+            pos = match.end()
+        if pos < len(text):
+            chunks.extend(textwrap.TextWrapper._split(self, text[pos:]))
+        return chunks
+
     @staticmethod
     def _len(item):
         """Custom len that gets console column width for wide
@@ -2716,7 +2755,9 @@ class _CustomTextWrap(textwrap.TextWrapper):
         as add any colors from previous lines order to preserve the same formatting
         as a single unwrapped string.
         """
-        code_matches = list(_ansi_codes.finditer(new_line))
+        # Only CSI sequences (colors, etc) are tracked here. OSC 8 hyperlinks
+        # are self-terminating and must not bleed into neighboring lines.
+        code_matches = list(_ansi_color_codes.finditer(new_line))
         color_codes = [code.string[code.span()[0] : code.span()[1]] for code in code_matches]
 
         # Add color codes from earlier in the unwrapped line, and then track any new ones we add.
