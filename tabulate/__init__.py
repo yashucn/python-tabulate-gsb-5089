@@ -801,6 +801,17 @@ _ansi_escape_pat = rf"""
         {_st}           # ST
         ([^{_esc}]+)    # link text - anything but ESC (submatch 4)
         {_osc}8;;{_st}  # "closing" OSC sequence
+    |
+        # terminal hyperlinks, opening sequence only (may appear on its own
+        # when the link text is split across lines while wrapping)
+        {_osc}8;        # OSC opening
+        (?:\w+=\w+:?)*  # key=value params list
+        ;               # delimiter
+        [^{_esc}]*      # URI - anything but ESC
+        {_st}           # ST
+    |
+        # terminal hyperlinks, "closing" OSC sequence only
+        {_osc}8;;{_st}
     )
 """
 _ansi_codes = re.compile(_ansi_escape_pat, re.VERBOSE)
@@ -1646,19 +1657,20 @@ def _wrap_text_to_colwidths(
                 # formatting of types (such as datetimes) may need to be more
                 # explicit than just `str` of the object. Also doesn't work for
                 # custom floatfmt/intfmt, nor with any missing/blank cells.
-                casted_cell = (
-                    missingval
-                    if cell is None
-                    else (
-                        str(cell)
-                        if cell == "" or _isnumber(cell)
-                        else str(_type(cell, numparse)(cell))
-                    )
-                )
+                if cell is None:
+                    casted_cell = missingval
+                elif cell == "" or _isnumber(cell) or not numparse:
+                    casted_cell = str(cell)
+                else:
+                    try:
+                        casted_cell = str(_type(cell, numparse=numparse)(cell))
+                    except (TypeError, ValueError):
+                        # e.g. "80,443" looks like a number with a thousands
+                        # separator but cannot be converted; keep it as-is
+                        casted_cell = str(cell)
                 wrapped = [
-                    "\n".join(wrapper.wrap(line))
+                    "\n".join(wrapper.wrap(line)) if line.strip() != "" else ""
                     for line in casted_cell.splitlines()
-                    if line.strip() != ""
                 ]
                 new_row.append("\n".join(wrapped))
             else:
@@ -2243,8 +2255,6 @@ def tabulate(
     list_of_lists, separating_lines = _remove_separating_lines(list_of_lists)
 
     if maxcolwidths is not None:
-        if type(maxcolwidths) is tuple:  # Check if tuple, convert to list if so
-            maxcolwidths = list(maxcolwidths)
         if len(list_of_lists):
             num_cols = len(list_of_lists[0])
         else:
@@ -2488,7 +2498,7 @@ def _expand_iterable(original, num_desired, default):
     length `num_desired` completely populated with `default will be returned
     """
     if isinstance(original, Iterable) and not isinstance(original, str):
-        return original + [default] * (num_desired - len(original))
+        return list(original) + [default] * (num_desired - len(original))
     else:
         return [default] * num_desired
 
@@ -2717,7 +2727,13 @@ class _CustomTextWrap(textwrap.TextWrapper):
         as a single unwrapped string.
         """
         code_matches = list(_ansi_codes.finditer(new_line))
-        color_codes = [code.string[code.span()[0] : code.span()[1]] for code in code_matches]
+        # Only CSI sequences (colors etc) need to be tracked and terminated;
+        # OSC hyperlinks are self-terminating and must be left untouched.
+        color_codes = [
+            code.string[code.span()[0] : code.span()[1]]
+            for code in code_matches
+            if code.string[code.span()[0] : code.span()[1]].startswith("\x1b[")
+        ]
 
         # Add color codes from earlier in the unwrapped line, and then track any new ones we add.
         new_line = "".join(self._active_codes) + new_line
